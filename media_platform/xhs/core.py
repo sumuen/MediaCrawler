@@ -33,6 +33,7 @@ from .exception import DataFetchError
 from .field import SearchSortType
 from .help import parse_note_info_from_note_url, get_search_id
 from .login import XiaoHongShuLogin
+from tools.excel_reader import read_keywords_from_excel
 
 
 class XiaoHongShuCrawler(AbstractCrawler):
@@ -113,14 +114,34 @@ class XiaoHongShuCrawler(AbstractCrawler):
         utils.logger.info(
             "[XiaoHongShuCrawler.search] Begin search xiaohongshu keywords"
         )
+        
+        # 导入Excel读取工具
+        from tools.excel_reader import read_keywords_from_excel
+        import os
+        
         xhs_limit_count = 20  # xhs limit page fixed value
         if config.CRAWLER_MAX_NOTES_COUNT < xhs_limit_count:
             config.CRAWLER_MAX_NOTES_COUNT = xhs_limit_count
         start_page = config.START_PAGE
-        for keyword in config.KEYWORDS.split(","):
+        
+        # 检查keywords.xlsx文件是否存在
+        excel_path = "data/keywords.xlsx"
+        if not os.path.exists(excel_path):
+            utils.logger.error(f"[XiaoHongShuCrawler.search] Excel文件 {excel_path} 不存在，将使用配置文件中的关键词")
+            keyword_pairs = [(None, keyword) for keyword in config.KEYWORDS.split(",")]
+        else:
+            # 从Excel文件中读取关键词和景点ID
+            keyword_pairs = read_keywords_from_excel(excel_path)
+            if not keyword_pairs:
+                utils.logger.error(f"[XiaoHongShuCrawler.search] 从Excel文件中读取关键词失败，将使用配置文件中的关键词")
+                keyword_pairs = [(None, keyword) for keyword in config.KEYWORDS.split(",")]
+            else:
+                utils.logger.info(f"[XiaoHongShuCrawler.search] 从Excel文件中读取到 {len(keyword_pairs)} 个关键词")
+        
+        for attraction_id, keyword in keyword_pairs:
             source_keyword_var.set(keyword)
             utils.logger.info(
-                f"[XiaoHongShuCrawler.search] Current search keyword: {keyword}"
+                f"[XiaoHongShuCrawler.search] Current search keyword: {keyword}, attraction_id: {attraction_id}"
             )
             page = 1
             search_id = get_search_id()
@@ -161,6 +182,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                             xsec_source=post_item.get("xsec_source"),
                             xsec_token=post_item.get("xsec_token"),
                             semaphore=semaphore,
+                            attraction_id=attraction_id,  # 传递景点ID
                         )
                         for post_item in notes_res.get("items", {})
                         if post_item.get("model_type") not in ("rec_query", "hot_query")
@@ -272,66 +294,29 @@ class XiaoHongShuCrawler(AbstractCrawler):
         xsec_source: str,
         xsec_token: str,
         semaphore: asyncio.Semaphore,
+        attraction_id: str = None,  # 添加景点ID参数
     ) -> Optional[Dict]:
-        """Get note detail
-
-        Args:
-            note_id:
-            xsec_source:
-            xsec_token:
-            semaphore:
-
-        Returns:
-            Dict: note detail
-        """
-        note_detail_from_html, note_detail_from_api = None, None
+        """Get note detail information."""
         async with semaphore:
-            # When proxy is not enabled, increase the crawling interval
-            if config.ENABLE_IP_PROXY:
-                crawl_interval = random.random()
-            else:
-                crawl_interval = random.uniform(1, config.CRAWLER_MAX_SLEEP_SEC)
             try:
-                # 尝试直接获取网页版笔记详情，携带cookie
-                note_detail_from_html: Optional[Dict] = (
-                    await self.xhs_client.get_note_by_id_from_html(
-                        note_id, xsec_source, xsec_token, enable_cookie=True
-                    )
+                note_detail = await self.xhs_client.get_note_by_id(
+                    note_id=note_id, xsec_source=xsec_source, xsec_token=xsec_token
                 )
-                time.sleep(crawl_interval)
-                if not note_detail_from_html:
-                    # 如果网页版笔记详情获取失败，则尝试不使用cookie获取
-                    note_detail_from_html = (
-                        await self.xhs_client.get_note_by_id_from_html(
-                            note_id, xsec_source, xsec_token, enable_cookie=False
-                        )
-                    )
-                    utils.logger.error(
-                        f"[XiaoHongShuCrawler.get_note_detail_async_task] Get note detail error, note_id: {note_id}"
-                    )
-                if not note_detail_from_html:
-                    # 如果网页版笔记详情获取失败，则尝试API获取
-                    note_detail_from_api: Optional[Dict] = (
-                        await self.xhs_client.get_note_by_id(
-                            note_id, xsec_source, xsec_token
-                        )
-                    )
-                note_detail = note_detail_from_html or note_detail_from_api
                 if note_detail:
-                    note_detail.update(
-                        {"xsec_token": xsec_token, "xsec_source": xsec_source}
-                    )
+                    note_detail["xsec_token"] = xsec_token
+                    # 将景点ID添加到笔记详情中
+                    if attraction_id:
+                        note_detail["attraction_id"] = attraction_id
                     return note_detail
-            except DataFetchError as ex:
+            except RetryError:
                 utils.logger.error(
-                    f"[XiaoHongShuCrawler.get_note_detail_async_task] Get note detail error: {ex}"
+                    f"[XiaoHongShuCrawler.get_note_detail_async_task] Get note detail error, note_id: {note_id}"
                 )
-                return None
-            except KeyError as ex:
+            except Exception as e:
                 utils.logger.error(
-                    f"[XiaoHongShuCrawler.get_note_detail_async_task] have not fund note detail note_id:{note_id}, err: {ex}"
+                    f"[XiaoHongShuCrawler.get_note_detail_async_task] Get note detail error, note_id: {note_id}, error: {e}"
                 )
-                return None
+            return None
 
     async def batch_get_note_comments(
         self, note_list: List[str], xsec_tokens: List[str]
